@@ -46,10 +46,17 @@ This tool is ideal for professionals, students, and anyone who wants to **stay o
 
 ---
 
-## ⚙️ Installation
+## Install dependencies:
 
-1. Clone this repository:
+pip install -r requirements.txt
 
-```bash
-git clone https://github.com/yourusername/email-sorting-bot-ml.git
-cd email-sorting-bot-ml
+---
+
+Create a config.json file with your credentials:
+
+{
+    "email": "your_email@gmail.com",
+    "password": "your_app_password",
+    "pushbullet_token": "your_pushbullet_access_token"
+}
+
