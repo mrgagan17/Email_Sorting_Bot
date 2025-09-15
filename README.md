@@ -55,8 +55,12 @@ pip install -r requirements.txt
 Create a config.json file with your credentials:
 
 {
+
     "email": "your_email@gmail.com",
+
     "password": "your_app_password",
+
     "pushbullet_token": "your_pushbullet_access_token"
+
 }
 
