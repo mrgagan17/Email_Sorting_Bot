@@ -3,7 +3,6 @@ import imaplib
 import email
 import json
 import pickle
-import requests
 import re
 from email.header import decode_header
 from email.mime.text import MIMEText
@@ -17,26 +16,21 @@ with open("config.json", "r") as f:
 
 EMAIL_ACCOUNT = cfg["email"]
 PASSWORD = cfg["password"]
-PUSHBULLET_TOKEN = cfg.get("pushbullet_token", "")
+MOBILE_EMAIL = cfg.get("mobile_email", EMAIL_ACCOUNT)  # send high-priority notifications here
 
-# probability threshold for accepting model prediction
 PROB_THRESHOLD = 0.60
-# how many recent messages to process
 MAX_EMAILS = 100
 # ------------------------------------------
 
-# Load trained pipeline (vectorizer + clf)
+# Load trained pipeline
 with open("model.pkl", "rb") as f:
     model = pickle.load(f)
 
-# Helpful keyword lists
 HIGH_KEYWORDS = [
-    # Tasks / assignments
     "task completion", "task complete", "assignment", "assignment submission",
     "submit assignment", "submit", "deadline", "due", "urgent",
     "project report", "interview", "action required", "complete the task",
     "submit your assignment", "submission",
-    # Security & account alerts
     "password", "reset your password", "unusual activity", "security alert",
     "login attempt", "api token", "token expire", "verify your account",
     "account suspended", "account locked", "sign-in attempt", "account activity"
@@ -48,9 +42,9 @@ LOW_KEYWORDS = [
     "no-reply", "daily digest"
 ]
 
-# domains we generally treat as low/promotional
 LOW_DOMAIN_KEYWORDS = ["pushbullet.com", "udemy", "e.udemymail.com", "amazon", "newsletter", "mailer"]
 
+# ----------------- FUNCTIONS -----------------
 def clean_text(s: str) -> str:
     if not s:
         return ""
@@ -102,17 +96,14 @@ def apply_overrides(text, sender):
     text_l = text.lower()
     dom = domain_of(sender)
 
-    # 🔹 First check HIGH keywords (includes security alerts)
     for kw in HIGH_KEYWORDS:
         if kw in text_l:
             return "High", f"kw:{kw}"
 
-    # 🔹 Then check domain-based low
     for kd in LOW_DOMAIN_KEYWORDS:
         if kd in dom or kd in text_l:
             return "Low", f"domain-low:{kd}"
 
-    # 🔹 Finally check low keywords
     for kw in LOW_KEYWORDS:
         if kw in text_l:
             return "Low", f"kw:{kw}"
@@ -194,62 +185,43 @@ def fetch_and_classify():
                         "note": note
                     })
 
-        except KeyboardInterrupt:
-            print("Interrupted by user.")
-            break
         except Exception as e:
             print("Error processing a message:", e)
             continue
 
     mail.logout()
-
-    def _key(x):
-        try:
-            return datetime.strptime(x["date"], "%Y-%m-%d %H:%M")
-        except:
-            return datetime.now()
-
-    results.sort(key=_key, reverse=True)
+    results.sort(key=lambda x: datetime.strptime(x["date"], "%Y-%m-%d %H:%M") 
+                 if len(x["date"]) >= 16 else datetime.now(), reverse=True)
     return results
 
-def send_pushbullet_notification(item):
-    if not PUSHBULLET_TOKEN:
+# ----------------- SEND HIGH PRIORITY EMAIL -----------------
+def send_high_priority_email(items):
+    high_items = [it for it in items if it["priority"] == "High" and it["prob"] >= PROB_THRESHOLD]
+    if not high_items:
+        print("No high-priority emails to send.")
         return
-    data = {
-        "type": "note",
-        "title": f"{item['priority'].upper()} priority email",
-        "body": f"{item['date']}\n{item['subject']}\nFrom: {item['from']}\nNote: {item['note']}"
-    }
-    try:
-        requests.post("https://api.pushbullet.com/v2/pushes",
-                      data=data,
-                      headers={"Access-Token": PUSHBULLET_TOKEN}, timeout=10)
-    except Exception as e:
-        print("Pushbullet error:", e)
 
-def send_summary_email(items):
-    if not items:
-        print("No recent emails to summarize.")
-        return
-    body = "Email Priority Summary (last 30 days)\n\n"
-    for it in items:
+    body = "High-Priority Emails (last 30 days):\n\n"
+    for it in high_items:
         body += f"[{it['priority']}] {it['date']} - {it['subject']} - {it['from']} (p={it['prob']:.2f}) note={it['note']}\n"
 
     msg = MIMEText(body)
     msg["From"] = EMAIL_ACCOUNT
-    msg["To"] = EMAIL_ACCOUNT
-    msg["Subject"] = "Email Priority Summary (last 30 days)"
+    msg["To"] = MOBILE_EMAIL
+    msg["Subject"] = "High-Priority Emails Summary"
+
     try:
         with smtplib.SMTP_SSL("smtp.gmail.com", 465) as server:
             server.login(EMAIL_ACCOUNT, PASSWORD)
             server.send_message(msg)
+        print(f"✅ High-priority email summary sent to {MOBILE_EMAIL}")
     except Exception as e:
-        print("Could not send summary email:", e)
+        print("Could not send high-priority email:", e)
 
+# ----------------- MAIN -----------------
 if __name__ == "__main__":
     items = fetch_and_classify()
     for it in items:
         print(f"[{it['priority']}] {it['date']} - {it['subject']} - {it['from']} (p={it['prob']:.2f}) {it['note']}")
-        if it['priority'] == "High" and it['prob'] >= PROB_THRESHOLD:
-            send_pushbullet_notification(it)
-    send_summary_email(items)
+
+    send_high_priority_email(items)
