@@ -1,0 +1,255 @@
+# main.py
+import imaplib
+import email
+import json
+import pickle
+import requests
+import re
+from email.header import decode_header
+from email.mime.text import MIMEText
+import smtplib
+from datetime import datetime, timedelta
+from html import unescape
+
+# ----------------- CONFIG -----------------
+with open("config.json", "r") as f:
+    cfg = json.load(f)
+
+EMAIL_ACCOUNT = cfg["email"]
+PASSWORD = cfg["password"]
+PUSHBULLET_TOKEN = cfg.get("pushbullet_token", "")
+
+# probability threshold for accepting model prediction
+PROB_THRESHOLD = 0.60
+# how many recent messages to process
+MAX_EMAILS = 100
+# ------------------------------------------
+
+# Load trained pipeline (vectorizer + clf)
+with open("model.pkl", "rb") as f:
+    model = pickle.load(f)
+
+# Helpful keyword lists
+HIGH_KEYWORDS = [
+    # Tasks / assignments
+    "task completion", "task complete", "assignment", "assignment submission",
+    "submit assignment", "submit", "deadline", "due", "urgent",
+    "project report", "interview", "action required", "complete the task",
+    "submit your assignment", "submission",
+    # Security & account alerts
+    "password", "reset your password", "unusual activity", "security alert",
+    "login attempt", "api token", "token expire", "verify your account",
+    "account suspended", "account locked", "sign-in attempt", "account activity"
+]
+
+LOW_KEYWORDS = [
+    "unsubscribe", "offer", "promotion", "discount", "newsletter", "receipt",
+    "order confirmation", "welcome to", "verify email", "password reset link",
+    "no-reply", "daily digest"
+]
+
+# domains we generally treat as low/promotional
+LOW_DOMAIN_KEYWORDS = ["pushbullet.com", "udemy", "e.udemymail.com", "amazon", "newsletter", "mailer"]
+
+def clean_text(s: str) -> str:
+    if not s:
+        return ""
+    s = unescape(s)
+    s = re.sub(r"<[^>]+>", " ", s)
+    s = re.sub(r"\s+", " ", s)
+    return s.strip()
+
+def extract_body(msg_obj):
+    body = ""
+    if msg_obj.is_multipart():
+        for part in msg_obj.walk():
+            ct = part.get_content_type()
+            disp = str(part.get("Content-Disposition"))
+            if ct == "text/plain" and "attachment" not in disp:
+                try:
+                    part_payload = part.get_payload(decode=True)
+                    if part_payload:
+                        body = part_payload.decode(errors="replace")
+                        return clean_text(body)
+                except:
+                    continue
+        for part in msg_obj.walk():
+            if part.get_content_type() == "text/html":
+                try:
+                    html_payload = part.get_payload(decode=True)
+                    if html_payload:
+                        h = html_payload.decode(errors="replace")
+                        text = re.sub(r"<[^>]+>", " ", h)
+                        return clean_text(text)
+                except:
+                    continue
+    else:
+        try:
+            payload = msg_obj.get_payload(decode=True)
+            if payload:
+                return clean_text(payload.decode(errors="replace"))
+        except:
+            return clean_text(str(msg_obj.get_payload()))
+    return ""
+
+def domain_of(sender):
+    if not sender:
+        return ""
+    m = re.search(r"@([A-Za-z0-9.-]+)", sender)
+    return m.group(1).lower() if m else ""
+
+def apply_overrides(text, sender):
+    text_l = text.lower()
+    dom = domain_of(sender)
+
+    # 🔹 First check HIGH keywords (includes security alerts)
+    for kw in HIGH_KEYWORDS:
+        if kw in text_l:
+            return "High", f"kw:{kw}"
+
+    # 🔹 Then check domain-based low
+    for kd in LOW_DOMAIN_KEYWORDS:
+        if kd in dom or kd in text_l:
+            return "Low", f"domain-low:{kd}"
+
+    # 🔹 Finally check low keywords
+    for kw in LOW_KEYWORDS:
+        if kw in text_l:
+            return "Low", f"kw:{kw}"
+
+    return None, None
+
+def fetch_and_classify():
+    mail = imaplib.IMAP4_SSL("imap.gmail.com")
+    mail.login(EMAIL_ACCOUNT, PASSWORD)
+    mail.select("inbox")
+
+    since_date = (datetime.now() - timedelta(days=30)).strftime("%d-%b-%Y")
+    typ, data = mail.search(None, f'(SINCE {since_date})')
+    if typ != "OK":
+        print("No messages found.")
+        return []
+
+    all_ids = data[0].split()
+    if not all_ids:
+        return []
+
+    email_ids = all_ids[-MAX_EMAILS:]
+
+    results = []
+    for eid in email_ids:
+        try:
+            typ, msg_data = mail.fetch(eid, "(RFC822)")
+            if typ != "OK":
+                continue
+            for part in msg_data:
+                if isinstance(part, tuple):
+                    msg_obj = email.message_from_bytes(part[1])
+
+                    subj, enc = decode_header(msg_obj.get("Subject", ""))[0]
+                    if isinstance(subj, bytes):
+                        try:
+                            subj = subj.decode(enc if enc else "utf-8", errors="replace")
+                        except:
+                            subj = subj.decode("utf-8", errors="replace")
+                    subj = subj or ""
+
+                    sender = msg_obj.get("From", "Unknown")
+                    date_raw = msg_obj.get("Date", "")
+                    try:
+                        date_dt = email.utils.parsedate_to_datetime(date_raw)
+                        date_str = date_dt.strftime("%Y-%m-%d %H:%M")
+                    except:
+                        date_str = date_raw
+
+                    body = extract_body(msg_obj)
+                    combined = f"{subj} {sender} {body}".strip()
+
+                    override_label, reason = apply_overrides(combined, sender)
+                    if override_label:
+                        label = override_label
+                        prob = 1.0
+                        note = f"override:{reason}"
+                    else:
+                        probs = model.predict_proba([combined])[0]
+                        classes = model.classes_
+                        top_idx = probs.argmax()
+                        top_prob = probs[top_idx]
+                        predicted = classes[top_idx]
+                        if top_prob < PROB_THRESHOLD:
+                            label = "Others"
+                            prob = float(top_prob)
+                            note = f"low_confidence:{top_prob:.2f}"
+                        else:
+                            label = predicted
+                            prob = float(top_prob)
+                            note = f"model:{predicted}:{top_prob:.2f}"
+
+                    results.append({
+                        "date": date_str,
+                        "subject": subj,
+                        "from": sender,
+                        "priority": label,
+                        "prob": prob,
+                        "note": note
+                    })
+
+        except KeyboardInterrupt:
+            print("Interrupted by user.")
+            break
+        except Exception as e:
+            print("Error processing a message:", e)
+            continue
+
+    mail.logout()
+
+    def _key(x):
+        try:
+            return datetime.strptime(x["date"], "%Y-%m-%d %H:%M")
+        except:
+            return datetime.now()
+
+    results.sort(key=_key, reverse=True)
+    return results
+
+def send_pushbullet_notification(item):
+    if not PUSHBULLET_TOKEN:
+        return
+    data = {
+        "type": "note",
+        "title": f"{item['priority'].upper()} priority email",
+        "body": f"{item['date']}\n{item['subject']}\nFrom: {item['from']}\nNote: {item['note']}"
+    }
+    try:
+        requests.post("https://api.pushbullet.com/v2/pushes",
+                      data=data,
+                      headers={"Access-Token": PUSHBULLET_TOKEN}, timeout=10)
+    except Exception as e:
+        print("Pushbullet error:", e)
+
+def send_summary_email(items):
+    if not items:
+        print("No recent emails to summarize.")
+        return
+    body = "Email Priority Summary (last 30 days)\n\n"
+    for it in items:
+        body += f"[{it['priority']}] {it['date']} - {it['subject']} - {it['from']} (p={it['prob']:.2f}) note={it['note']}\n"
+
+    msg = MIMEText(body)
+    msg["From"] = EMAIL_ACCOUNT
+    msg["To"] = EMAIL_ACCOUNT
+    msg["Subject"] = "Email Priority Summary (last 30 days)"
+    try:
+        with smtplib.SMTP_SSL("smtp.gmail.com", 465) as server:
+            server.login(EMAIL_ACCOUNT, PASSWORD)
+            server.send_message(msg)
+    except Exception as e:
+        print("Could not send summary email:", e)
+
+if __name__ == "__main__":
+    items = fetch_and_classify()
+    for it in items:
+        print(f"[{it['priority']}] {it['date']} - {it['subject']} - {it['from']} (p={it['prob']:.2f}) {it['note']}")
+        if it['priority'] == "High" and it['prob'] >= PROB_THRESHOLD:
+            send_pushbullet_notification(it)
+    send_summary_email(items)
