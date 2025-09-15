@@ -52,7 +52,7 @@ pip install -r requirements.txt
 
 ---
 
-Create a config.json file with your credentials:
+Create a **config.json** file with your credentials:
 
 {
 
