@@ -46,6 +46,10 @@ This tool is ideal for professionals, students, and anyone who wants to **stay o
 
 ---
 
+When you run the **train_model.py** it will generate model.pkl and vectorizer.pkl files
+
+
+---
 ## Install dependencies:
 
 pip install -r requirements.txt
